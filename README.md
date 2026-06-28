@@ -1,180 +1,122 @@
-[![Mailing list : test](http://img.shields.io/badge/Email-gray.svg?style=for-the-badge&logo=gmail)](mailto:hello@silero.ai) [![Mailing list : test](http://img.shields.io/badge/Telegram-blue.svg?style=for-the-badge&logo=telegram)](https://t.me/silero_speech) [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-MIT-lightgrey.svg?style=for-the-badge)](https://github.com/snakers4/silero-vad/blob/master/LICENSE) [![downloads](https://img.shields.io/pypi/dm/silero-vad?style=for-the-badge)](https://pypi.org/project/silero-vad/) 
+# Silero VAD 一键部署服务
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/snakers4/silero-vad/blob/master/silero-vad.ipynb) [![Test Package](https://github.com/snakers4/silero-vad/actions/workflows/test.yml/badge.svg)](https://github.com/snakers4/silero-vad/actions/workflows/test.yml) [![Pypi version](https://img.shields.io/pypi/v/silero-vad)](https://pypi.org/project/silero-vad/) [![Python version](https://img.shields.io/pypi/pyversions/silero-vad)](https://pypi.org/project/silero-vad)
+本 README 为服务一键部署和客户端使用说明。原始项目说明见 [README.original.md](README.original.md)。
 
-![header](https://user-images.githubusercontent.com/12515440/89997349-b3523080-dc94-11ea-9906-ca2e8bc50535.png)
+## 环境要求
 
-<br/>
-<h1 align="center">Silero VAD</h1>
-<br/>
+- Linux 或 macOS
+- Python 3.8+
+- CPU 可运行，支持多 worker 并发
+- GPU 并发需要 CUDA 版 PyTorch 和可用 NVIDIA 驱动
 
-**Silero VAD** - pre-trained enterprise-grade [Voice Activity Detector](https://en.wikipedia.org/wiki/Voice_activity_detection) (also see our [STT models](https://github.com/snakers4/silero-models)).
+## 安装
 
-<br/>
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/dfd29c4f-226a-4687-8bea-e8faaaee0287" />
-</p>
-
-
-<details>
-<summary>Real Time Example</summary>
-
-https://user-images.githubusercontent.com/36505480/144874384-95f80f6d-a4f1-42cc-9be7-004c891dd481.mp4
-
-Please note, that video loads only if you are logged in your GitHub account. 
-
-</details>
-
-<br/>
-
-<h2 align="center">Fast start</h2>
-<br/>
-
-<details>
-<summary>Dependencies</summary>
-
-  System requirements to run python examples on `x86-64` systems:
-  
-  - `python 3.8+`;
-  - 1G+ RAM;
-  - A modern CPU with AVX, AVX2, AVX-512 or AMX instruction sets.
-
-  Dependencies:
-  
-  - `torch>=1.12.0`;
-  - `torchaudio>=0.12.0` (for I/O only);
-  - `onnxruntime>=1.16.1` (for ONNX model usage).
-  
-  Silero VAD uses torchaudio library for audio I/O (`torchaudio.info`, `torchaudio.load`, and `torchaudio.save`), so a proper audio backend is required:
-  
-  - Option №1 - [**FFmpeg**](https://www.ffmpeg.org/) backend. `conda install -c conda-forge 'ffmpeg<7'`;
-  - Option №2 - [**sox_io**](https://pypi.org/project/sox/) backend. `apt-get install sox`, TorchAudio is tested on libsox 14.4.2;
-  - Option №3 - [**soundfile**](https://pypi.org/project/soundfile/) backend. `pip install soundfile`.
-
-If you are planning to run the VAD using solely the `onnx-runtime`, it will run on any other system architectures where onnx-runtume is [supported](https://onnxruntime.ai/getting-started). In this case please note that:
-
-- You will have to implement the I/O;
-- You will have to adapt the existing wrappers / examples / post-processing for your use-case.
-
-</details>
-
-**Using pip**:
-`pip install silero-vad`
-
-```python3
-from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
-model = load_silero_vad()
-wav = read_audio('path_to_audio_file')
-speech_timestamps = get_speech_timestamps(
-  wav,
-  model,
-  return_seconds=True,  # Return speech timestamps in seconds (default is samples)
-)
+```bash
+chmod +x install.sh start.sh
+bash install.sh
 ```
 
-**Using torch.hub**:
-```python3
-import torch
-torch.set_num_threads(1)
+`install.sh` 在下载 pip 包时会关闭代理：脚本会清空 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 等大小写代理环境变量，并使用 `pip --isolated` 避免读取 pip 用户配置中的代理。若需要指定镜像源，可继续使用 `PIP_INDEX_URL`、`PIP_EXTRA_INDEX_URL` 和 `PIP_TRUSTED_HOST`，脚本会把这些值显式传给 pip。
 
-model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad')
-(get_speech_timestamps, _, read_audio, _, _) = utils
+脚本默认安装 CPU 版 PyTorch，避免在有 `nvidia-smi` 的机器上隐式下载很大的 CUDA wheel。CPU 并发不需要额外配置。若要启用 GPU 并发，需要安装 CUDA 版 PyTorch：
 
-wav = read_audio('path_to_audio_file')
-speech_timestamps = get_speech_timestamps(
-  wav,
-  model,
-  return_seconds=True,  # Return speech timestamps in seconds (default is samples)
-)
+```bash
+INSTALL_GPU_TORCH=1 bash install.sh
 ```
 
-<br/>
+## 服务启动
 
-<h2 align="center">Key Features</h2>
-<br/>
-
-- **Stellar accuracy**
-
-  Silero VAD has [excellent results](https://github.com/snakers4/silero-vad/wiki/Quality-Metrics#vs-other-available-solutions) on speech detection tasks.
-  
-- **Fast**
-
-  One audio chunk (30+ ms) [takes](https://github.com/snakers4/silero-vad/wiki/Performance-Metrics#silero-vad-performance-metrics) less than **1ms** to be processed on a single CPU thread. Using batching or GPU can also improve performance considerably. Under certain conditions ONNX may even run up to 4-5x faster. 
-
-- **Lightweight**
-
-  JIT model is around two megabytes in size.
-
-- **General**
-
-  Silero VAD was trained on huge corpora that include over **6000** languages and it performs well on audios from different domains with various background noise and quality levels.
-
-- **Flexible sampling rate**
-
-  Silero VAD [supports](https://github.com/snakers4/silero-vad/wiki/Quality-Metrics#sample-rate-comparison)  **8000 Hz** and **16000 Hz** [sampling rates](https://en.wikipedia.org/wiki/Sampling_(signal_processing)#Sampling_rate).
-
-- **Highly Portable**
-
-  Silero VAD reaps benefits from the rich ecosystems built around **PyTorch** and **ONNX** running everywhere where these runtimes are available.
-
-- **No Strings Attached**
-
-   Published under permissive license (MIT) Silero VAD has zero strings attached - no telemetry, no keys, no registration, no built-in expiration, no keys or vendor lock.
-
-<br/>
-
-<h2 align="center">Typical Use Cases</h2>
-<br/>
-
-- Voice activity detection for IOT / edge / mobile use cases
-- Data cleaning and preparation, voice detection in general
-- Telephony and call-center automation, voice bots
-- Voice interfaces
-
-<br/>
-<h2 align="center">Links</h2>
-<br/>
-
-
-- [Examples and Dependencies](https://github.com/snakers4/silero-vad/wiki/Examples-and-Dependencies#dependencies)
-- [Quality Metrics](https://github.com/snakers4/silero-vad/wiki/Quality-Metrics)
-- [Performance Metrics](https://github.com/snakers4/silero-vad/wiki/Performance-Metrics)
-- [Versions and Available Models](https://github.com/snakers4/silero-vad/wiki/Version-history-and-Available-Models)
-- [Further reading](https://github.com/snakers4/silero-models#further-reading)
-- [FAQ](https://github.com/snakers4/silero-vad/wiki/FAQ)
-
-<br/>
-<h2 align="center">Get In Touch</h2>
-<br/>
-
-Try our models, create an [issue](https://github.com/snakers4/silero-vad/issues/new), start a [discussion](https://github.com/snakers4/silero-vad/discussions/new), join our telegram [chat](https://t.me/silero_speech), [email](mailto:hello@silero.ai) us, read our [news](https://t.me/silero_news).
-
-Please see our [wiki](https://github.com/snakers4/silero-models/wiki) for relevant information and [email](mailto:hello@silero.ai) us directly.
-
-**Citations**
-
+```bash
+bash start.sh --port 8000 --model-workers 4
 ```
-@misc{Silero VAD,
-  author = {Silero Team},
-  title = {Silero VAD: pre-trained enterprise-grade Voice Activity Detector (VAD), Number Detector and Language Classifier},
-  year = {2024},
-  publisher = {GitHub},
-  journal = {GitHub repository},
-  howpublished = {\url{https://github.com/snakers4/silero-vad}},
-  commit = {insert_some_commit_here},
-  email = {hello@silero.ai}
+
+CPU 并发默认使用 ONNX Runtime，每个 worker 持有一个独立模型实例：
+
+```bash
+bash start.sh --port 8000 --device cpu --onnx --model-workers 8
+```
+
+GPU 并发使用 TorchScript，每个 worker 持有一个 GPU 模型实例；启动前需要用 `INSTALL_GPU_TORCH=1 bash install.sh` 安装 CUDA 版 PyTorch：
+
+```bash
+bash start.sh --port 8000 --device cuda --torch --model-workers 4
+```
+
+可选参数：
+
+- `--host`：默认 `0.0.0.0`
+- `--port`：默认 `8000`
+- `--model-workers`：模型实例数量，默认 `min(CPU 核数, 4)`；CPU/GPU 并发都由这个参数控制
+- `--device`：`cpu`、`cuda`、`cuda:<index>` 或 `auto`
+- `--cpu`：等价于 `--device cpu`
+- `--cuda`/`--gpu`：等价于 `--device cuda --torch`
+- `--onnx`：默认，使用 ONNX Runtime CPU 推理
+- `--torch`：使用 TorchScript 推理，GPU 模式必须使用该后端
+
+## 客户端请求
+
+健康检查：
+
+```bash
+curl http://localhost:8000/health
+```
+
+发送 WAV 文件：
+
+```bash
+curl -s -X POST "http://localhost:8000/v1/vad?sample_rate=16000&return_seconds=true" \
+  -H "Content-Type: audio/wav" \
+  --data-binary @tests/data/test.wav
+```
+
+发送裸 PCM，格式为单声道 `s16le`：
+
+```bash
+curl -s -X POST "http://localhost:8000/v1/vad?sample_rate=16000&encoding=pcm_s16le&channels=1" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @audio.s16le
+```
+
+响应示例：
+
+```json
+{
+  "segments": [{"start": 0.3, "end": 1.7}],
+  "sample_rate": 16000,
+  "duration_seconds": 2.0,
+  "speech_seconds": 1.4,
+  "processing_seconds": 0.01,
+  "worker_id": 0
 }
 ```
 
-<br/>
-<h2 align="center">Examples and VAD-based Community Apps</h2>
-<br/>
+## 压测
 
-- Example of VAD ONNX Runtime model usage in [C++](https://github.com/snakers4/silero-vad/tree/master/examples/cpp)
+先启动服务，然后运行：
 
-- Example of VAD [ExecuTorch](https://github.com/pytorch/executorch) model usage in [C++](https://github.com/pytorch/executorch/tree/main/examples/models/silero_vad)
+```bash
+source .venv/bin/activate
+python serving/performance_testing.py --concurrency 1,4,16,64,256 --requests 64
+```
 
-- Voice activity detection for the [browser](https://github.com/ricky0123/vad) using ONNX Runtime Web
+默认使用仓库内 `tests/data/test.wav`。如需使用 Hugging Face `xcczach/sample-data` 中的音频，可先下载到本地，再通过 `--audio path/to/audio.wav` 指定。
 
-- [Rust](https://github.com/snakers4/silero-vad/tree/master/examples/rust-example), [Rust (wavekat-vad)](https://github.com/snakers4/silero-vad/tree/master/examples/rust-wav-processing-with-wavekat-vad), [Go](https://github.com/snakers4/silero-vad/tree/master/examples/go), [Java](https://github.com/snakers4/silero-vad/tree/master/examples/java-example), [C++](https://github.com/snakers4/silero-vad/tree/master/examples/cpp), [C#](https://github.com/snakers4/silero-vad/tree/master/examples/csharp) and [other](https://github.com/snakers4/silero-vad/tree/master/examples) community examples
+验证环境：Linux 5.15.0-141-generic x86_64，Intel Xeon Gold 6530，Python 3.13.9，torch 2.9.1+cpu，ONNX Runtime 1.27.0，--model-workers 1，样本 tests/data/test.wav，每档 8 个请求。
+
+| 并发 | 成功/总数 | 错误 | 平均延时(s) | p50(s) | p95(s) | 吞吐(req/s) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8/8 | 0 | 0.394 | 0.383 | 0.442 | 2.54 |
+| 4 | 8/8 | 0 | 1.238 | 1.519 | 1.527 | 2.63 |
+| 16 | 8/8 | 0 | 1.748 | 1.941 | 3.083 | 2.59 |
+| 64 | 8/8 | 0 | 1.723 | 1.912 | 3.041 | 2.63 |
+| 256 | 8/8 | 0 | 1.721 | 1.907 | 3.043 | 2.63 |
+
+GPU 验证环境：Linux 5.15.0-141-generic x86_64，NVIDIA GeForce RTX 4090，driver 570.124.06，Python 3.13.9，torch 2.9.1+cu128，CUDA 12.8，ONNX Runtime 1.27.0，启动参数 --device cuda:0 --torch --model-workers 4，样本 tests/data/test.wav，每档 64 个请求。压测前 GPU0 显存占用约 26170 MiB/49140 MiB，压测期间服务使用 GPU0。
+
+| 并发 | 成功/总数 | 错误 | 平均延时(s) | p50(s) | p95(s) | 吞吐(req/s) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 64/64 | 0 | 0.811 | 0.803 | 0.913 | 1.23 |
+| 4 | 64/64 | 0 | 2.027 | 2.017 | 2.166 | 1.97 |
+| 16 | 64/64 | 0 | 7.384 | 8.127 | 8.274 | 1.96 |
+| 64 | 64/64 | 0 | 17.391 | 18.368 | 32.308 | 1.96 |
+| 256 | 64/64 | 0 | 17.312 | 18.243 | 32.192 | 1.97 |
