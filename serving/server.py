@@ -25,6 +25,7 @@ _worker_queue: asyncio.Queue = None
 _executor: concurrent.futures.ThreadPoolExecutor = None
 _use_onnx = True
 _device = "cpu"
+_ws_max_inflight = 2
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -181,12 +182,13 @@ class StreamingVadSession:
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _device, _executor, _use_onnx, _worker_queue, _workers
+    global _device, _executor, _use_onnx, _worker_queue, _workers, _ws_max_inflight
 
     torch.set_num_threads(_env_int("TORCH_NUM_THREADS", 1, 1, 64))
     cpu_count = os.cpu_count() or 1
     worker_count = _env_int("VAD_MODEL_WORKERS", min(cpu_count, 4), 1, 64)
     _use_onnx = _env_bool("VAD_USE_ONNX", True)
+    _ws_max_inflight = _env_int("VAD_WS_MAX_INFLIGHT", 2, 1, 16)
     requested_device = os.getenv("VAD_DEVICE", "cpu").strip().lower()
     if requested_device == "auto":
         _device = "cuda" if (not _use_onnx and torch.cuda.is_available()) else "cpu"
@@ -221,6 +223,7 @@ async def health() -> Dict[str, Any]:
         "model_workers": len(_workers),
         "onnx": _use_onnx,
         "device": _device,
+        "ws_max_inflight": _ws_max_inflight,
         "cuda_available": torch.cuda.is_available(),
         "cuda_device_count": torch.cuda.device_count(),
     }
@@ -427,6 +430,38 @@ async def _send_frame_responses(websocket: WebSocket, responses: List[Dict[str, 
         await websocket.send_json(response)
 
 
+async def _stream_processor(
+    websocket: WebSocket,
+    queue: asyncio.Queue,
+    session: StreamingVadSession,
+    config: Dict[str, Any],
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    while True:
+        command, payload = await queue.get()
+        try:
+            if command == "audio":
+                try:
+                    audio = _decode_pcm(payload or b"", config["sample_rate"], config["encoding"], config["channels"])
+                    responses = await loop.run_in_executor(_executor, partial(session.process_audio, audio))
+                except ValueError as exc:
+                    await _send_ws_error(websocket, "invalid_frame", str(exc))
+                    continue
+                except Exception as exc:
+                    await _send_ws_error(websocket, "internal_error", str(exc))
+                    continue
+                await _send_frame_responses(websocket, responses)
+            elif command == "reset":
+                await loop.run_in_executor(_executor, session.reset)
+                await websocket.send_json({"type": "reset_ack"})
+            elif command == "flush":
+                responses = await loop.run_in_executor(_executor, session.flush)
+                await _send_frame_responses(websocket, responses)
+                await websocket.send_json({"type": "flush_ack"})
+        finally:
+            queue.task_done()
+
+
 @app.websocket("/ws/vad")
 async def vad_stream(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -440,6 +475,8 @@ async def vad_stream(websocket: WebSocket) -> None:
     worker: Optional[VadWorker] = None
     session: Optional[StreamingVadSession] = None
     config: Optional[Dict[str, Any]] = None
+    stream_queue: Optional[asyncio.Queue] = None
+    processor_task: Optional[asyncio.Task] = None
 
     try:
         while True:
@@ -468,6 +505,14 @@ async def vad_stream(websocket: WebSocket) -> None:
 
                     if worker is None:
                         worker = await _worker_queue.get()
+                    if stream_queue is not None:
+                        await stream_queue.join()
+                    if processor_task is not None:
+                        processor_task.cancel()
+                        try:
+                            await processor_task
+                        except asyncio.CancelledError:
+                            pass
 
                     session = StreamingVadSession(
                         worker.model,
@@ -477,15 +522,20 @@ async def vad_stream(websocket: WebSocket) -> None:
                         config["negative_speech_threshold"],
                         config["redemption_frames"],
                     )
+                    stream_queue = asyncio.Queue(maxsize=_ws_max_inflight)
+                    processor_task = asyncio.create_task(
+                        _stream_processor(websocket, stream_queue, session, config, loop)
+                    )
                     await websocket.send_json(
                         {
                             "type": "start_ack",
                             "sample_rate": config["sample_rate"],
                             "frame_samples": session.frame_samples,
+                            "max_inflight": _ws_max_inflight,
                         }
                     )
                 elif command == "audio":
-                    if session is None or config is None:
+                    if stream_queue is None:
                         await _send_ws_error(websocket, "not_started", "send start before audio")
                         continue
                     try:
@@ -493,32 +543,26 @@ async def vad_stream(websocket: WebSocket) -> None:
                         if not isinstance(audio_b64, str):
                             raise ValueError("audio must be a base64 string")
                         audio_bytes = base64.b64decode(audio_b64, validate=True)
-                        audio = _decode_pcm(audio_bytes, config["sample_rate"], config["encoding"], config["channels"])
-                        responses = await loop.run_in_executor(_executor, partial(session.process_audio, audio))
                     except KeyError:
                         await _send_ws_error(websocket, "invalid_frame", "missing audio")
                         continue
                     except (binascii.Error, ValueError) as exc:
                         await _send_ws_error(websocket, "invalid_frame", str(exc))
                         continue
-                    except Exception as exc:
-                        await _send_ws_error(websocket, "internal_error", str(exc))
-                        continue
-                    await _send_frame_responses(websocket, responses)
+                    await stream_queue.put(("audio", audio_bytes))
                 elif command == "reset":
-                    if session is None:
+                    if stream_queue is None:
                         await _send_ws_error(websocket, "not_started", "stream has not been started")
                     else:
-                        await loop.run_in_executor(_executor, session.reset)
-                        await websocket.send_json({"type": "reset_ack"})
+                        await stream_queue.put(("reset", None))
                 elif command == "flush":
-                    if session is None:
+                    if stream_queue is None:
                         await _send_ws_error(websocket, "not_started", "stream has not been started")
                     else:
-                        responses = await loop.run_in_executor(_executor, session.flush)
-                        await _send_frame_responses(websocket, responses)
-                        await websocket.send_json({"type": "flush_ack"})
+                        await stream_queue.put(("flush", None))
                 elif command == "close":
+                    if stream_queue is not None:
+                        await stream_queue.join()
                     await websocket.close()
                     break
                 else:
@@ -528,23 +572,19 @@ async def vad_stream(websocket: WebSocket) -> None:
             if data is None:
                 continue
 
-            if session is None or config is None:
+            if stream_queue is None:
                 await _send_ws_error(websocket, "not_started", "send start before binary audio")
                 continue
 
-            try:
-                audio = _decode_pcm(data, config["sample_rate"], config["encoding"], config["channels"])
-                responses = await loop.run_in_executor(_executor, partial(session.process_audio, audio))
-            except ValueError as exc:
-                await _send_ws_error(websocket, "invalid_frame", str(exc))
-                continue
-            except Exception as exc:
-                await _send_ws_error(websocket, "internal_error", str(exc))
-                continue
-
-            await _send_frame_responses(websocket, responses)
+            await stream_queue.put(("audio", data))
     except WebSocketDisconnect:
         pass
     finally:
+        if processor_task is not None:
+            processor_task.cancel()
+            try:
+                await processor_task
+            except asyncio.CancelledError:
+                pass
         if worker is not None:
             _worker_queue.put_nowait(worker)
