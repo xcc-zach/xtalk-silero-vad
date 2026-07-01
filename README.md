@@ -90,6 +90,44 @@ curl -s -X POST "http://localhost:8000/v1/vad?sample_rate=16000&encoding=pcm_s16
 }
 ```
 
+流式 VAD 使用 WebSocket，一条连接对应一个连续音频流：
+
+```text
+ws://localhost:8000/ws/vad
+```
+
+连接后先发送 `start` 控制消息，再持续发送二进制 PCM16 mono little-endian 音频。binary 消息可以任意大小，服务端会按 `frame_samples` 切帧；16 kHz 推荐 512 samples。
+
+```json
+{"type":"start","sample_rate":16000,"frame_samples":512,"encoding":"pcm_s16le","channels":1,"positive_speech_threshold":0.8,"negative_speech_threshold":0.2,"redemption_frames":16}
+```
+
+也支持 JSON base64 音频，但推荐使用 binary：
+
+```json
+{"type":"audio","seq":12,"audio":"<base64 pcm_s16le>"}
+```
+
+客户端控制消息：
+
+```json
+{"type":"reset"}
+{"type":"flush"}
+{"type":"close"}
+```
+
+服务端事件：
+
+```json
+{"type":"start_ack","sample_rate":16000,"frame_samples":512}
+{"type":"frame","seq":42,"timestamp_ms":1344,"speech_prob":0.91,"not_speech_prob":0.09,"is_speech":true}
+{"type":"reset_ack"}
+{"type":"flush_ack"}
+{"type":"error","code":"invalid_frame","message":"audio must be pcm_s16le mono"}
+```
+
+`flush` 会把缓冲区里不足一帧的残留音频补零并返回该帧结果，然后返回 `flush_ack`；它不会重置模型状态。要结束当前流并重新开始，请发送 `reset`。
+
 ## 压测
 
 先启动服务，然后运行：

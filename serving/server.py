@@ -1,16 +1,19 @@
 import asyncio
+import base64
+import binascii
 import concurrent.futures
 import io
+import json
 import os
 import tempfile
 import wave
 import time
 from functools import partial
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
 from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
 
@@ -90,6 +93,92 @@ class VadWorker:
         }
 
 
+class StreamingVadSession:
+    def __init__(
+        self,
+        model,
+        sampling_rate: int,
+        frame_samples: int,
+        positive_speech_threshold: float,
+        negative_speech_threshold: float,
+        redemption_frames: int,
+    ):
+        if sampling_rate not in {8000, 16000}:
+            raise ValueError("streaming sample_rate must be 8000 or 16000")
+        expected_frame_samples = 512 if sampling_rate == 16000 else 256
+        if frame_samples != expected_frame_samples:
+            raise ValueError(f"frame_samples must be {expected_frame_samples} for sample_rate={sampling_rate}")
+
+        self.model = model
+        self.sampling_rate = sampling_rate
+        self.frame_samples = frame_samples
+        self.positive_speech_threshold = positive_speech_threshold
+        self.negative_speech_threshold = negative_speech_threshold
+        self.redemption_frames = redemption_frames
+        self.pending = torch.empty(0, dtype=torch.float32)
+        self.reset()
+
+    def reset(self) -> None:
+        self.model.reset_states()
+        self.pending = torch.empty(0, dtype=torch.float32)
+        self.seq = 0
+        self.in_speech = False
+        self.redemption_counter = 0
+
+    def _timestamp_ms(self) -> int:
+        return int(round(self.seq * self.frame_samples / self.sampling_rate * 1000))
+
+    def _process_frame(self, frame: torch.Tensor) -> Dict[str, Any]:
+        speech_prob = float(self.model(frame, self.sampling_rate).item())
+        not_speech_prob = 1.0 - speech_prob
+
+        if not self.in_speech:
+            if speech_prob >= self.positive_speech_threshold:
+                self.in_speech = True
+                self.redemption_counter = 0
+        else:
+            if speech_prob < self.negative_speech_threshold:
+                self.redemption_counter += 1
+                if self.redemption_counter >= self.redemption_frames:
+                    self.in_speech = False
+                    self.redemption_counter = 0
+            else:
+                self.redemption_counter = 0
+
+        response = {
+            "type": "frame",
+            "seq": self.seq,
+            "timestamp_ms": self._timestamp_ms(),
+            "speech_prob": round(speech_prob, 6),
+            "not_speech_prob": round(not_speech_prob, 6),
+            "is_speech": bool(self.in_speech),
+        }
+        self.seq += 1
+        return response
+
+    def process_audio(self, audio: torch.Tensor) -> List[Dict[str, Any]]:
+        if audio.numel() == 0:
+            return []
+
+        self.pending = torch.cat([self.pending, audio.float()])
+        messages: List[Dict[str, Any]] = []
+
+        while self.pending.numel() >= self.frame_samples:
+            frame = self.pending[: self.frame_samples]
+            self.pending = self.pending[self.frame_samples :]
+            messages.append(self._process_frame(frame))
+
+        return messages
+
+    def flush(self) -> List[Dict[str, Any]]:
+        if self.pending.numel() == 0:
+            return []
+
+        frame = torch.nn.functional.pad(self.pending, (0, self.frame_samples - self.pending.numel()))
+        self.pending = torch.empty(0, dtype=torch.float32)
+        return [self._process_frame(frame)]
+
+
 @app.on_event("startup")
 async def startup() -> None:
     global _device, _executor, _use_onnx, _worker_queue, _workers
@@ -139,7 +228,7 @@ async def health() -> Dict[str, Any]:
 
 @app.get("/")
 async def root() -> Dict[str, str]:
-    return {"service": "silero-vad", "health": "/health", "vad": "/v1/vad"}
+    return {"service": "silero-vad", "health": "/health", "vad": "/v1/vad", "vad_stream": "/ws/vad"}
 
 
 def _decode_pcm(body: bytes, sample_rate: int, encoding: str, channels: int) -> torch.Tensor:
@@ -289,3 +378,173 @@ async def vad(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         _worker_queue.put_nowait(worker)
+
+
+def _stream_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sample_rate = int(payload.get("sample_rate", 16000))
+    frame_samples = int(payload.get("frame_samples", 512 if sample_rate == 16000 else 256))
+    encoding = str(payload.get("encoding", "pcm_s16le"))
+    channels = int(payload.get("channels", 1))
+    positive_speech_threshold = float(payload.get("positive_speech_threshold", 0.8))
+    negative_speech_threshold = float(payload.get("negative_speech_threshold", 0.2))
+    redemption_frames = int(payload.get("redemption_frames", 16))
+
+    if sample_rate not in {8000, 16000}:
+        raise ValueError("sample_rate must be 8000 or 16000 for streaming")
+    expected_frame_samples = 512 if sample_rate == 16000 else 256
+    if frame_samples != expected_frame_samples:
+        raise ValueError(f"frame_samples must be {expected_frame_samples} for sample_rate={sample_rate}")
+    if encoding.lower().replace("-", "_") != "pcm_s16le":
+        raise ValueError("encoding must be pcm_s16le")
+    if channels != 1:
+        raise ValueError("channels must be 1")
+    if positive_speech_threshold < 0.0 or positive_speech_threshold > 1.0:
+        raise ValueError("positive_speech_threshold must be between 0.0 and 1.0")
+    if negative_speech_threshold < 0.0 or negative_speech_threshold > 1.0:
+        raise ValueError("negative_speech_threshold must be between 0.0 and 1.0")
+    if negative_speech_threshold > positive_speech_threshold:
+        raise ValueError("negative_speech_threshold must be <= positive_speech_threshold")
+    if redemption_frames < 1:
+        raise ValueError("redemption_frames must be >= 1")
+
+    return {
+        "sample_rate": sample_rate,
+        "frame_samples": frame_samples,
+        "encoding": encoding,
+        "channels": channels,
+        "positive_speech_threshold": positive_speech_threshold,
+        "negative_speech_threshold": negative_speech_threshold,
+        "redemption_frames": redemption_frames,
+    }
+
+
+async def _send_ws_error(websocket: WebSocket, code: str, message: str) -> None:
+    await websocket.send_json({"type": "error", "code": code, "message": message})
+
+
+async def _send_frame_responses(websocket: WebSocket, responses: List[Dict[str, Any]]) -> None:
+    for response in responses:
+        await websocket.send_json(response)
+
+
+@app.websocket("/ws/vad")
+async def vad_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    if _executor is None or _worker_queue is None:
+        await _send_ws_error(websocket, "service_unavailable", "service is still starting")
+        await websocket.close(code=1013)
+        return
+
+    loop = asyncio.get_running_loop()
+    worker: Optional[VadWorker] = None
+    session: Optional[StreamingVadSession] = None
+    config: Optional[Dict[str, Any]] = None
+
+    try:
+        while True:
+            message = await websocket.receive()
+            message_type = message.get("type")
+            if message_type == "websocket.disconnect":
+                break
+
+            text = message.get("text")
+            data = message.get("bytes")
+
+            if text is not None:
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    await _send_ws_error(websocket, "invalid_json", f"invalid JSON message: {exc.msg}")
+                    continue
+
+                command = payload.get("type")
+                if command == "start":
+                    try:
+                        config = _stream_config(payload)
+                    except Exception as exc:
+                        await _send_ws_error(websocket, "invalid_start", str(exc))
+                        continue
+
+                    if worker is None:
+                        worker = await _worker_queue.get()
+
+                    session = StreamingVadSession(
+                        worker.model,
+                        config["sample_rate"],
+                        config["frame_samples"],
+                        config["positive_speech_threshold"],
+                        config["negative_speech_threshold"],
+                        config["redemption_frames"],
+                    )
+                    await websocket.send_json(
+                        {
+                            "type": "start_ack",
+                            "sample_rate": config["sample_rate"],
+                            "frame_samples": session.frame_samples,
+                        }
+                    )
+                elif command == "audio":
+                    if session is None or config is None:
+                        await _send_ws_error(websocket, "not_started", "send start before audio")
+                        continue
+                    try:
+                        audio_b64 = payload["audio"]
+                        if not isinstance(audio_b64, str):
+                            raise ValueError("audio must be a base64 string")
+                        audio_bytes = base64.b64decode(audio_b64, validate=True)
+                        audio = _decode_pcm(audio_bytes, config["sample_rate"], config["encoding"], config["channels"])
+                        responses = await loop.run_in_executor(_executor, partial(session.process_audio, audio))
+                    except KeyError:
+                        await _send_ws_error(websocket, "invalid_frame", "missing audio")
+                        continue
+                    except (binascii.Error, ValueError) as exc:
+                        await _send_ws_error(websocket, "invalid_frame", str(exc))
+                        continue
+                    except Exception as exc:
+                        await _send_ws_error(websocket, "internal_error", str(exc))
+                        continue
+                    await _send_frame_responses(websocket, responses)
+                elif command == "reset":
+                    if session is None:
+                        await _send_ws_error(websocket, "not_started", "stream has not been started")
+                    else:
+                        await loop.run_in_executor(_executor, session.reset)
+                        await websocket.send_json({"type": "reset_ack"})
+                elif command == "flush":
+                    if session is None:
+                        await _send_ws_error(websocket, "not_started", "stream has not been started")
+                    else:
+                        responses = await loop.run_in_executor(_executor, session.flush)
+                        await _send_frame_responses(websocket, responses)
+                        await websocket.send_json({"type": "flush_ack"})
+                elif command == "close":
+                    await websocket.close()
+                    break
+                else:
+                    await _send_ws_error(websocket, "unsupported_message", "unsupported message type")
+                continue
+
+            if data is None:
+                continue
+
+            if session is None or config is None:
+                await _send_ws_error(websocket, "not_started", "send start before binary audio")
+                continue
+
+            try:
+                audio = _decode_pcm(data, config["sample_rate"], config["encoding"], config["channels"])
+                responses = await loop.run_in_executor(_executor, partial(session.process_audio, audio))
+            except ValueError as exc:
+                await _send_ws_error(websocket, "invalid_frame", str(exc))
+                continue
+            except Exception as exc:
+                await _send_ws_error(websocket, "internal_error", str(exc))
+                continue
+
+            await _send_frame_responses(websocket, responses)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if worker is not None:
+            _worker_queue.put_nowait(worker)

@@ -90,6 +90,44 @@ Example response:
 }
 ```
 
+Streaming VAD uses WebSocket. One connection represents one continuous audio stream:
+
+```text
+ws://localhost:8000/ws/vad
+```
+
+After connecting, send a `start` control message first, then stream binary PCM16 mono little-endian audio. Binary messages may be any size; the server splits them by `frame_samples`. Use 512 samples for 16 kHz.
+
+```json
+{"type":"start","sample_rate":16000,"frame_samples":512,"encoding":"pcm_s16le","channels":1,"positive_speech_threshold":0.8,"negative_speech_threshold":0.2,"redemption_frames":16}
+```
+
+JSON base64 audio is also supported, but binary is recommended:
+
+```json
+{"type":"audio","seq":12,"audio":"<base64 pcm_s16le>"}
+```
+
+Client control messages:
+
+```json
+{"type":"reset"}
+{"type":"flush"}
+{"type":"close"}
+```
+
+Server events:
+
+```json
+{"type":"start_ack","sample_rate":16000,"frame_samples":512}
+{"type":"frame","seq":42,"timestamp_ms":1344,"speech_prob":0.91,"not_speech_prob":0.09,"is_speech":true}
+{"type":"reset_ack"}
+{"type":"flush_ack"}
+{"type":"error","code":"invalid_frame","message":"audio must be pcm_s16le mono"}
+```
+
+`flush` zero-pads any buffered partial frame and returns that frame result, then sends `flush_ack`. It does not reset model state. Send `reset` to discard the current stream state and start over.
+
 ## Benchmark
 
 Start the service first, then run:
